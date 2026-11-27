@@ -73,6 +73,28 @@ public abstract sealed class Pcap implements AutoCloseable permits Pcap0_4 {
 	private static final String COMMUNITY_KEY = "4EA214-2858D5-41D389-DED990-F96F95-94BCF4";
 
 	/**
+	 * 3.0.0 set {@code fsName} to {@code "jnetpcap.lic"}, so sdk-common looked up
+	 * {@code jnetpcap.lic.license.key}. Kept as a fallback for installs that still
+	 * set that property.
+	 */
+	static final String LEGACY_LICENSE_KEY_PROPERTY = "jnetpcap.lic.license.key";
+
+	/**
+	 * Optional replacement for {@link KeyResolver}. Production leaves this
+	 * {@code null}. Tests set it to force a resolver failure without a Windows
+	 * filesystem and without a network.
+	 */
+	static volatile LicenseKeyLookup licenseKeyOverride;
+
+	/**
+	 * Supplies the license key string, or {@code null} when none is configured.
+	 */
+	@FunctionalInterface
+	interface LicenseKeyLookup {
+		String find() throws LicenseException;
+	}
+
+	/**
 	 * Activates the product license using automatic key resolution.
 	 * 
 	 * <p>
@@ -97,6 +119,11 @@ public abstract sealed class Pcap implements AutoCloseable permits Pcap0_4 {
 	 * </ol>
 	 * 
 	 * <p>
+	 * The legacy system property {@code jnetpcap.lic.license.key} from 3.0.0 is
+	 * still accepted when none of the sources above yields a key.
+	 * </p>
+	 * 
+	 * <p>
 	 * The embedded community key provides unlimited activations with feature
 	 * restrictions. To unlock all features, install a commercial key in any of the
 	 * above locations.
@@ -105,14 +132,10 @@ public abstract sealed class Pcap implements AutoCloseable permits Pcap0_4 {
 	 * @see #activateLicense(String)
 	 */
 	public static void activateLicense() throws LicenseException {
-		ProductConfig cfg = new ProductConfig();
-		cfg.envPrefix = "JNETPCAP";
-		cfg.fsName = "jnetpcap.lic";
-		cfg.homeDir = System.getProperty("user.home");
-		cfg.productName = "jNetPcap SDK";
-		cfg.version = VERSION;
-
-		String key = new KeyResolver().findLicenseKey(cfg);
+		LicenseKeyLookup lookup = licenseKeyOverride != null
+				? licenseKeyOverride
+				: Pcap::resolveLicenseKey;
+		String key = lookup.find();
 
 		if (key == null)
 			key = COMMUNITY_KEY; // embedded community key — silent, this is the expected default
@@ -120,6 +143,48 @@ public abstract sealed class Pcap implements AutoCloseable permits Pcap0_4 {
 			logger.debug("License key resolved");
 
 		activateLicense(key);
+	}
+
+	/**
+	 * Product configuration passed to sdk-common {@link KeyResolver}.
+	 *
+	 * <p>
+	 * {@code KeyResolver} always does {@code Path.of(user.home, homeDir, fsName + ".lic")}
+	 * and reads the system property {@code fsName + ".license.key"}. {@code homeDir}
+	 * must be a relative directory ({@code .jnetpcap}) and {@code fsName} must be
+	 * {@code jnetpcap} (no {@code .lic} suffix). Passing {@code user.home} as
+	 * {@code homeDir} and {@code jnetpcap.lic} as {@code fsName} — what 3.0.0 did —
+	 * builds {@code C:\Users\me\C:\Users\me\jnetpcap.lic.lic}, which
+	 * {@code Path.of} rejects on Windows with {@code InvalidPathException}.
+	 * </p>
+	 *
+	 * @return a config whose home file is {@code ~/.jnetpcap/jnetpcap.lic}
+	 */
+	static ProductConfig licenseProductConfig() {
+		ProductConfig cfg = new ProductConfig();
+		cfg.envPrefix = "JNETPCAP";
+		cfg.fsName = "jnetpcap";
+		cfg.homeDir = ".jnetpcap";
+		cfg.productName = "jNetPcap SDK";
+		cfg.version = VERSION;
+		return cfg;
+	}
+
+	/**
+	 * Resolves a license key using {@link KeyResolver} and the 3.0.0 property name
+	 * as a fallback. Does not activate.
+	 *
+	 * @return the key, or {@code null} when nothing is configured
+	 * @throws LicenseException if a configured license file cannot be read
+	 */
+	static String resolveLicenseKey() throws LicenseException {
+		String key = new KeyResolver().findLicenseKey(licenseProductConfig());
+		if (key == null) {
+			String legacy = System.getProperty(LEGACY_LICENSE_KEY_PROPERTY);
+			if (legacy != null && legacy.length() > 20)
+				key = legacy.trim();
+		}
+		return key;
 	}
 
 	/**
@@ -1830,12 +1895,47 @@ public abstract sealed class Pcap implements AutoCloseable permits Pcap0_4 {
 		this.pcapHeaderABI = abi;
 		this.pcapHandle = requireNonNull(pcapHandle, "pcapHandle"); //$NON-NLS-1$
 
-		// Step 1: ensure activation has been attempted
-		License.ensureActivated(Pcap::activateLicense, logger);
+		ensureLicenseForOpen();
+	}
 
-		// Step 2: verify directly with Cryptlex — no local state trusted
+	/**
+	 * License gate for every Pcap constructor (live, offline, and dead).
+	 *
+	 * <p>
+	 * sdk-common's {@code License.ensureActivated} only catches
+	 * {@code LicenseException}. {@code KeyResolver} can throw
+	 * {@code InvalidPathException} (a {@code RuntimeException}) when the license
+	 * path is illegal. That must be logged and must not stop the handle from
+	 * opening; the call continues in community mode.
+	 * </p>
+	 */
+	static void ensureLicenseForOpen() {
+		try {
+			// A test override has to run even when Cryptlex already reports active,
+			// otherwise ensureActivated's fast path would hide the injected failure.
+			if (licenseKeyOverride != null)
+				activateLicense();
+			else
+				License.ensureActivated(Pcap::activateLicense, logger);
+		} catch (RuntimeException e) {
+			logger.warn("License check failed ({}); falling back to community mode", e.toString(), e);
+			activateCommunityQuietly();
+			return;
+		}
+
+		// Step 2: verify directly with Cryptlex — no local state trusted.
+		// Skipped after a path failure: a bad license path must not block open.
 		if (!License.isActivated())
 			throw new LicenseException("License not activated.");
+	}
+
+	/** Community-key activation that cannot itself fail the constructor. */
+	private static void activateCommunityQuietly() {
+		try {
+			activateLicense(COMMUNITY_KEY);
+		} catch (Throwable t) {
+			logger.warn("Community license fallback failed: {}", t.toString());
+		}
 	}
 
 	public MemorySegment handle() {
